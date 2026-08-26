@@ -1,0 +1,722 @@
+// AlKÉ Finance — schéma de base de données (PostgreSQL)
+// Couvre : authentification, KYC, wallet/FX, catalogue multi-marché,
+// moteur d'ordres multi-marché (BVMAC/BRVM), pipeline de partenaires
+// boursiers (SDB/SGI), back-office, conformité/audit.
+// Référence documentaire : ALKE-CDC-2026-001, ALKE-BACKEND-2026-001,
+// ALKE-BOURSE-2026-001/002.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =========================================================================
+// 1. UTILISATEURS, AUTHENTIFICATION, SÉCURITÉ
+// =========================================================================
+
+enum UserRole {
+  USER
+  SUPPORT
+  COMPLIANCE
+  ADMIN
+}
+
+enum SupportedCountry {
+  CIV // Côte d'Ivoire (BRVM / CREPMF)
+  SEN // Sénégal (BRVM / CREPMF)
+  TGO // Togo (BRVM / CREPMF)
+  BEN // Bénin (BRVM / CREPMF)
+  BFA // Burkina Faso (BRVM / CREPMF)
+  MLI // Mali (BRVM / CREPMF)
+  CMR // Cameroun (BVMAC / COSUMAF)
+  GAB // Gabon (BVMAC / COSUMAF)
+  COG // Congo (BVMAC / COSUMAF)
+  INTL // Diaspora / international
+}
+
+enum KycStatus {
+  NOT_STARTED
+  PENDING
+  IN_REVIEW
+  VERIFIED
+  REJECTED
+}
+
+enum RiskProfile {
+  PRUDENT
+  EQUILIBRE
+  DYNAMIQUE
+}
+
+model User {
+  id                String      @id @default(uuid())
+  fullName          String
+  email             String      @unique
+  phone             String      @unique
+  passwordHash      String
+  country           SupportedCountry
+  displayCurrency   String      @default("XOF")
+  role              UserRole    @default(USER)
+  kycStatus         KycStatus   @default(NOT_STARTED)
+  kycRejectionReason String?
+  riskProfile       RiskProfile?
+  twoFactorEnabled  Boolean     @default(false)
+  biometricEnabled  Boolean     @default(false)
+  avatarSeed        String?
+  referralCode      String      @unique
+  referredById      String?
+  referredBy        User?       @relation("Referrals", fields: [referredById], references: [id])
+  referredUsers     User[]      @relation("Referrals")
+  isBlocked         Boolean     @default(false)
+  blockedReason      String?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  kycSubmissions    KycSubmission[]
+  accounts          Account[]
+  orders            Order[]
+  positions         Position[]
+  watchlist         WatchlistItem[]
+  externalHoldings  ExternalHolding[]
+  recurringPlans    RecurringPlan[]
+  subscription      Subscription?
+  notificationPref  NotificationPreference?
+  notifications     Notification[]
+  supportTickets    SupportTicket[]
+  npsResponses      NpsResponse[]
+  devices           UserDevice[]
+  referralsMade     Referral[]  @relation("ReferralReferrer")
+  referralReceived  Referral?   @relation("ReferralReferee")
+  auditLogsAsActor  AuditLog[]  @relation("AuditActor")
+  reviewedKyc       KycSubmission[] @relation("KycReviewer")
+
+  @@index([email])
+  @@index([phone])
+  @@index([kycStatus])
+}
+
+enum OtpPurpose {
+  REGISTER
+  LOGIN
+  RESET_PASSWORD
+  WITHDRAWAL
+  CHANGE_PHONE
+}
+
+model OtpCode {
+  id          String     @id @default(uuid())
+  destination String // e-mail ou téléphone ciblé
+  purpose     OtpPurpose
+  code        String
+  expiresAt   DateTime
+  consumedAt  DateTime?
+  attempts    Int        @default(0)
+  createdAt   DateTime   @default(now())
+
+  @@index([destination, purpose])
+}
+
+model UserDevice {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  label        String
+  platform     String
+  lastActiveAt DateTime @default(now())
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+}
+
+// =========================================================================
+// 2. KYC (MODULE 1)
+// =========================================================================
+
+enum DocumentType {
+  NATIONAL_ID
+  PASSPORT
+  DRIVER_LICENSE
+}
+
+model KycSubmission {
+  id                 String      @id @default(uuid())
+  userId             String
+  user               User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status             KycStatus   @default(PENDING)
+  documentType       DocumentType?
+  documentFrontUrl   String?
+  documentBackUrl    String?
+  selfieUrl          String?
+  questionnaire      Json? // profil investisseur, tolérance au risque, origine des fonds
+  rejectionReason    String?
+  submittedAt        DateTime    @default(now())
+  reviewedAt         DateTime?
+  reviewedByAdminId  String?
+  reviewedByAdmin    User?       @relation("KycReviewer", fields: [reviewedByAdminId], references: [id])
+
+  @@index([userId])
+  @@index([status])
+}
+
+// =========================================================================
+// 3. MARCHÉS, PARTENAIRES BOURSIERS (SDB / SGI), CATALOGUE
+//    Référence : ALKE-BOURSE-2026-001 (BVMAC) & -002 (multi-marchés, AELP)
+// =========================================================================
+
+enum MarketCode {
+  BVMAC // zone CEMAC — COSUMAF
+  BRVM // zone UEMOA — CREPMF
+  INTL // international (Twelve Data)
+  NGX // Nigeria — extension future (roadmap §3.2)
+  NSE // Kenya — extension future
+  EGX // Égypte — extension future
+  JSE // Afrique du Sud — extension future
+  CASABLANCA // Maroc — extension future
+  SEM // Maurice — extension future
+}
+
+enum MarketStatus {
+  SIMULATED_ONLY // Palier 0 — aucun partenaire actif, ordres toujours simulés
+  PARTNER_IN_PROGRESS // négociation en cours avec un partenaire
+  LIVE // partenaire actif, exécution réelle possible
+}
+
+model Market {
+  id          String       @id @default(uuid())
+  code        MarketCode   @unique
+  name        String
+  zone        String // ex. "Zone CEMAC", "Zone UEMOA"
+  currency    String
+  regulator   String // ex. COSUMAF, CREPMF, SEC Nigeria...
+  status      MarketStatus @default(SIMULATED_ONLY)
+  openingHoursNote String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  instruments Instrument[]
+  partners    MarketPartner[]
+  orders      Order[]
+  feeSchedules FeeSchedule[]
+  ingestionLogs MarketDataIngestionLog[]
+}
+
+enum PartnerType {
+  SDB // Société de Bourse — BVMAC / COSUMAF
+  SGI // Société de Gestion et d'Intermédiation — BRVM / CREPMF
+  BROKER // marchés anglophones (NGX, NSE, EGX, JSE...)
+}
+
+// Statut de la démarche de partenariat, tel que suivi dans le guide
+// ALKE-BOURSE-2026-001 (§6-9) et -002 (§7-9). C'est le "CRM" interne du
+// démarchage boursier — directement exploitable au jour le jour.
+enum PartnerAgreementStatus {
+  PROSPECT // identifié, pas encore contacté
+  CONTACTED // premier contact envoyé
+  MEETING_SCHEDULED
+  IN_DISCUSSION // grille de questions envoyée / échanges en cours
+  TERM_SHEET // conditions en cours de négociation
+  SIGNED // convention signée
+  ACTIVE // opérationnel (ordres réellement transmis)
+  DECLINED // partenariat écarté
+}
+
+// Palier d'intégration technique — Guide ALKE-BOURSE-2026-001 §8 / -002 §9
+enum IntegrationTier {
+  TIER0_SIMULATED // aucun canal, ordres simulés
+  TIER1_FILE // fichier/e-mail sécurisé, exécution manuelle côté partenaire
+  TIER2_BACKOFFICE_LINK // SFTP / webhook privé
+  TIER3_API // API partenaire dédiée ou AELP Link
+}
+
+model MarketPartner {
+  id                String                 @id @default(uuid())
+  marketId          String
+  market            Market                 @relation(fields: [marketId], references: [id])
+  name              String
+  type              PartnerType
+  agreementStatus   PartnerAgreementStatus @default(PROSPECT)
+  integrationTier   IntegrationTier        @default(TIER0_SIMULATED)
+  aelpParticipant   Boolean                @default(false) // participe à l'AELP (§4.4 du guide multi-marchés)
+  contactName       String?
+  contactEmail      String?
+  contactPhone      String?
+  notes             String? // compte-rendu de rendez-vous, points en négociation
+  agreementNumber   String? // ex. n° d'agrément COSUMAF quand connu
+  lastContactAt     DateTime?
+  createdAt         DateTime               @default(now())
+  updatedAt         DateTime               @updatedAt
+
+  orders            Order[]
+
+  @@index([marketId])
+  @@index([agreementStatus])
+}
+
+enum AssetClass {
+  STOCK
+  BOND
+}
+
+model Instrument {
+  id             String     @id @default(uuid())
+  marketId       String
+  market         Market     @relation(fields: [marketId], references: [id])
+  symbol         String
+  name           String
+  assetClass     AssetClass
+  sector         String?
+  currency       String
+  isActive       Boolean    @default(true)
+
+  // Actions
+  lastPrice      Decimal?   @db.Decimal(18, 4)
+  previousClose  Decimal?   @db.Decimal(18, 4)
+  dayHigh        Decimal?   @db.Decimal(18, 4)
+  dayLow         Decimal?   @db.Decimal(18, 4)
+  week52High     Decimal?   @db.Decimal(18, 4)
+  week52Low      Decimal?   @db.Decimal(18, 4)
+  marketCap      Decimal?   @db.Decimal(20, 2)
+  per            Decimal?   @db.Decimal(10, 2)
+  dividendYield  Decimal?   @db.Decimal(6, 3)
+
+  // Obligations
+  couponRate     Decimal?   @db.Decimal(6, 3)
+  maturityDate   DateTime?
+  nominalPrice   Decimal?   @db.Decimal(18, 4)
+  minSubscription Decimal?  @db.Decimal(18, 2)
+
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  quoteHistory   InstrumentQuote[]
+  orders         Order[]
+  positions      Position[]
+  watchedBy      WatchlistItem[]
+  recurringPlans RecurringPlan[]
+
+  @@unique([marketId, symbol])
+  @@index([assetClass])
+}
+
+// Historique de cours — alimenté soit par le job de traitement du Bulletin
+// Officiel de Cotation (BVMAC/BRVM), soit par Twelve Data (INTL).
+model InstrumentQuote {
+  id           String     @id @default(uuid())
+  instrumentId String
+  instrument   Instrument @relation(fields: [instrumentId], references: [id], onDelete: Cascade)
+  tradeDate    DateTime
+  open         Decimal    @db.Decimal(18, 4)
+  high         Decimal    @db.Decimal(18, 4)
+  low          Decimal    @db.Decimal(18, 4)
+  close        Decimal    @db.Decimal(18, 4)
+  volume       BigInt?
+  source       String // "BOC_MANUAL" | "BOC_INGEST" | "TWELVE_DATA"
+  createdAt    DateTime   @default(now())
+
+  @@unique([instrumentId, tradeDate])
+  @@index([instrumentId, tradeDate])
+}
+
+// Traçabilité de chaque import de cours (manuel ou automatisé) — cf. Guide
+// ALKE-BOURSE-2026-001 §8.1 (traitement du Bulletin Officiel de Cotation).
+model MarketDataIngestionLog {
+  id             String   @id @default(uuid())
+  marketId       String
+  market         Market   @relation(fields: [marketId], references: [id])
+  source         String // "BOC_MANUAL_ENTRY" | "BOC_FILE_UPLOAD" | "TWELVE_DATA"
+  performedByAdminId String?
+  rowsProcessed  Int      @default(0)
+  rowsFailed     Int      @default(0)
+  notes          String?
+  createdAt      DateTime @default(now())
+
+  @@index([marketId])
+}
+
+model WatchlistItem {
+  id           String     @id @default(uuid())
+  userId       String
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  instrumentId String
+  instrument   Instrument @relation(fields: [instrumentId], references: [id], onDelete: Cascade)
+  createdAt    DateTime   @default(now())
+
+  @@unique([userId, instrumentId])
+}
+
+// =========================================================================
+// 4. WALLET, PAIEMENT, FX (MODULE 2)
+// =========================================================================
+
+model Account {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  currency  String
+  balance   Decimal  @default(0) @db.Decimal(18, 2)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transactions WalletTransaction[]
+
+  @@unique([userId, currency])
+}
+
+enum WalletTransactionType {
+  DEPOSIT
+  WITHDRAWAL
+  FX_CONVERT_IN
+  FX_CONVERT_OUT
+  ORDER_DEBIT
+  ORDER_CREDIT
+  FEE
+  DIVIDEND
+  COUPON
+  REFERRAL_REWARD
+}
+
+enum WalletTransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum PaymentProvider {
+  MTN_MOMO
+  ORANGE_MONEY
+  CINETPAY
+  PAYDUNYA
+  BANK_TRANSFER
+  INTERNAL
+}
+
+model WalletTransaction {
+  id                String                   @id @default(uuid())
+  accountId         String
+  account           Account                  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  type              WalletTransactionType
+  amount            Decimal                  @db.Decimal(18, 2)
+  status            WalletTransactionStatus  @default(PENDING)
+  provider          PaymentProvider          @default(INTERNAL)
+  providerReference String?
+  feeAmount         Decimal                  @default(0) @db.Decimal(18, 2)
+  note              String?
+  createdAt         DateTime                 @default(now())
+  completedAt       DateTime?
+
+  @@index([accountId])
+  @@index([status])
+}
+
+model FxConversion {
+  id           String   @id @default(uuid())
+  userId       String
+  fromCurrency String
+  toCurrency   String
+  fromAmount   Decimal  @db.Decimal(18, 2)
+  toAmount     Decimal  @db.Decimal(18, 2)
+  rateApplied  Decimal  @db.Decimal(18, 8)
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+}
+
+// =========================================================================
+// 5. ORDRES — MOTEUR MULTI-MARCHÉ (MODULE 4)
+//    Référence : ALKE-BOURSE-2026-002 §5 — chaque ordre porte un marché et
+//    résout un partenaire ; Paliers 0-3 définis dans les guides bourse.
+// =========================================================================
+
+enum OrderSide {
+  BUY
+  SELL
+}
+
+enum OrderType {
+  MARKET
+  LIMIT
+}
+
+enum OrderStatus {
+  PENDING // enregistré côté ALKÉ, pas encore transmis
+  TRANSMITTED // transmis au partenaire (Palier 1+)
+  PARTIALLY_EXECUTED
+  EXECUTED
+  REJECTED
+  CANCELLED
+}
+
+model Order {
+  id               String          @id @default(uuid())
+  userId           String
+  user             User            @relation(fields: [userId], references: [id])
+  instrumentId     String
+  instrument       Instrument      @relation(fields: [instrumentId], references: [id])
+  marketId         String
+  market           Market          @relation(fields: [marketId], references: [id])
+  partnerId        String? // résolu automatiquement selon le marché — null tant qu'aucun partenaire actif
+  partner          MarketPartner?  @relation(fields: [partnerId], references: [id])
+  side             OrderSide
+  orderType        OrderType       @default(MARKET)
+  quantity         Decimal         @db.Decimal(18, 4)
+  limitPrice       Decimal?        @db.Decimal(18, 4)
+  estimatedPrice   Decimal         @db.Decimal(18, 4)
+  estimatedTotal   Decimal         @db.Decimal(18, 2)
+  brokerageFee     Decimal         @default(0) @db.Decimal(18, 2)
+  status           OrderStatus     @default(PENDING)
+  executionTier    IntegrationTier @default(TIER0_SIMULATED)
+  partnerReference String? // référence donnée par le partenaire (Palier 1+)
+  rejectionReason  String?
+  submittedAt      DateTime        @default(now())
+  transmittedAt    DateTime?
+  executedAt       DateTime?
+  executedPrice    Decimal?        @db.Decimal(18, 4)
+
+  @@index([userId])
+  @@index([marketId])
+  @@index([status])
+}
+
+model Position {
+  id           String     @id @default(uuid())
+  userId       String
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  instrumentId String
+  instrument   Instrument @relation(fields: [instrumentId], references: [id])
+  quantity     Decimal    @db.Decimal(18, 4)
+  avgCost      Decimal    @db.Decimal(18, 4)
+  currency     String
+  updatedAt    DateTime   @updatedAt
+
+  @@unique([userId, instrumentId])
+}
+
+enum RecurringFrequency {
+  WEEKLY
+  MONTHLY
+}
+
+model RecurringPlan {
+  id           String             @id @default(uuid())
+  userId       String
+  user         User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  instrumentId String
+  instrument   Instrument         @relation(fields: [instrumentId], references: [id])
+  amount       Decimal            @db.Decimal(18, 2)
+  currency     String
+  frequency    RecurringFrequency
+  active       Boolean            @default(true)
+  nextRunAt    DateTime
+  createdAt    DateTime           @default(now())
+
+  @@index([userId])
+  @@index([active, nextRunAt])
+}
+
+// =========================================================================
+// 6. FRAIS (MODULE 9.5)
+// =========================================================================
+
+enum FeeType {
+  BROKERAGE
+  FX_SPREAD
+  MANAGEMENT
+  WITHDRAWAL
+}
+
+model FeeSchedule {
+  id            String   @id @default(uuid())
+  marketId      String?
+  market        Market?  @relation(fields: [marketId], references: [id])
+  feeType       FeeType
+  isPercentage  Boolean  @default(true)
+  value         Decimal  @db.Decimal(10, 4) // ex. 1.5000 = 1,5 % si isPercentage, sinon montant fixe
+  minAmount     Decimal? @db.Decimal(18, 2)
+  maxAmount     Decimal? @db.Decimal(18, 2)
+  label         String
+  effectiveFrom DateTime @default(now())
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+// =========================================================================
+// 7. PORTEFEUILLE EXTERNE, PARRAINAGE, ABONNEMENT PRO, NOTIFICATIONS
+//    (fonctionnalités additionnelles déjà en place côté app — Module 7)
+// =========================================================================
+
+model ExternalHolding {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  label     String
+  assetType String
+  quantity  Decimal  @db.Decimal(18, 4)
+  avgCost   Decimal  @db.Decimal(18, 4)
+  currency  String
+  notes     String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+enum ReferralStatus {
+  INVITED
+  SIGNED_UP
+  FIRST_DEPOSIT_DONE
+  REWARDED
+}
+
+model Referral {
+  id              String         @id @default(uuid())
+  referrerUserId  String
+  referrer        User           @relation("ReferralReferrer", fields: [referrerUserId], references: [id])
+  refereeUserId   String?        @unique
+  referee         User?          @relation("ReferralReferee", fields: [refereeUserId], references: [id])
+  code            String
+  status          ReferralStatus @default(INVITED)
+  rewardAmount    Decimal?       @db.Decimal(18, 2)
+  rewardCurrency  String?
+  createdAt       DateTime       @default(now())
+  rewardedAt      DateTime?
+
+  @@index([referrerUserId])
+}
+
+enum ProPlan {
+  MONTHLY
+  YEARLY
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELLED
+  EXPIRED
+}
+
+model Subscription {
+  id          String             @id @default(uuid())
+  userId      String             @unique
+  user        User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan        ProPlan
+  status      SubscriptionStatus @default(ACTIVE)
+  startedAt   DateTime           @default(now())
+  renewsAt    DateTime?
+  cancelledAt DateTime?
+}
+
+model NotificationPreference {
+  id           String  @id @default(uuid())
+  userId       String  @unique
+  user         User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  push         Boolean @default(true)
+  priceAlerts  Boolean @default(true)
+  news         Boolean @default(true)
+  orders       Boolean @default(true)
+  promo        Boolean @default(false)
+  community    Boolean @default(true)
+  email        Boolean @default(true)
+}
+
+// Journal interne des notifications — consultable dans l'app même avant
+// que Firebase Cloud Messaging ne soit branché pour l'envoi push réel.
+model Notification {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  body      String
+  type      String
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, readAt])
+}
+
+model NpsResponse {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  score     Int
+  comment   String?
+  createdAt DateTime @default(now())
+}
+
+// =========================================================================
+// 8. SUPPORT CLIENT (MODULE 8)
+// =========================================================================
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+enum TicketPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+model SupportTicket {
+  id        String              @id @default(uuid())
+  userId    String
+  user      User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject   String
+  category  String
+  status    TicketStatus        @default(OPEN)
+  priority  TicketPriority      @default(NORMAL)
+  createdAt DateTime            @default(now())
+  closedAt  DateTime?
+
+  messages  SupportTicketMessage[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+enum TicketAuthorType {
+  USER
+  AGENT
+}
+
+model SupportTicketMessage {
+  id        String           @id @default(uuid())
+  ticketId  String
+  ticket    SupportTicket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorType TicketAuthorType
+  authorId  String?
+  body      String
+  createdAt DateTime         @default(now())
+
+  @@index([ticketId])
+}
+
+// =========================================================================
+// 9. CONFORMITÉ — JOURNAL D'AUDIT (MODULE 9.4)
+// =========================================================================
+
+model AuditLog {
+  id            String   @id @default(uuid())
+  actorUserId   String?
+  actor         User?    @relation("AuditActor", fields: [actorUserId], references: [id])
+  actorRole     String?
+  action        String // ex. "KYC_APPROVED", "ORDER_STATUS_CHANGED", "FEE_SCHEDULE_UPDATED"
+  entityType    String
+  entityId      String
+  beforeJson    Json?
+  afterJson     Json?
+  ipAddress     String?
+  createdAt     DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([action])
+  @@index([createdAt])
+}
