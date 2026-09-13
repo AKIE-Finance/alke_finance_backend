@@ -1,42 +1,47 @@
-import { Body, Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Patch, Post, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { KycStatus, UserRole } from '@prisma/client';
 import { KycService } from './kyc.service';
-import { SubmitKycDto } from './dto/submit-kyc.dto';
-import { ReviewKycDto } from './dto/review-kyc.dto';
+import { UpdateKycCaseDto } from './dto/update-case.dto';
+import { AddKycDocumentDto } from './dto/add-document.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
-import { RolesGuard } from '../../common/guards/roles.guard';
-import { Roles } from '../../common/decorators/roles.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { RequestUser } from '../../common/types/request-user';
 
 @ApiTags('kyc')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard)
 @Controller('kyc')
 export class KycController {
-  constructor(private kyc: KycService) {}
+  constructor(private readonly kyc: KycService) {}
 
-  @Post('submissions')
-  submit(@CurrentUser() user: any, @Body() dto: SubmitKycDto) {
-    return this.kyc.submit(user.id, dto);
+  @Post('case')
+  open(@CurrentUser() user: RequestUser) {
+    return this.kyc.openCase(user.id);
   }
 
+  @Get('case')
+  current(@CurrentUser() user: RequestUser) {
+    return this.kyc.myCase(user.id);
+  }
+
+  @Patch('case')
+  update(@CurrentUser() user: RequestUser, @Body() dto: UpdateKycCaseDto) {
+    return this.kyc.updateCase(user.id, dto);
+  }
+
+  @Post('case/documents')
+  addDocument(@CurrentUser() user: RequestUser, @Body() dto: AddKycDocumentDto) {
+    return this.kyc.addDocument(user.id, dto);
+  }
+
+  @Post('case/submit')
+  submit(@CurrentUser() user: RequestUser) {
+    return this.kyc.submit(user.id);
+  }
+
+  /** Alias kept for the mobile app contract. */
   @Get('submissions/me')
-  mine(@CurrentUser() user: any) {
+  mine(@CurrentUser() user: RequestUser) {
     return this.kyc.listMine(user.id);
-  }
-
-  @UseGuards(RolesGuard)
-  @Roles(UserRole.ADMIN, UserRole.COMPLIANCE)
-  @Get('submissions')
-  listForReview(@Query('status') status?: KycStatus) {
-    return this.kyc.listForReview(status);
-  }
-
-  @UseGuards(RolesGuard)
-  @Roles(UserRole.ADMIN, UserRole.COMPLIANCE)
-  @Post('submissions/:id/review')
-  review(@CurrentUser() user: any, @Param('id') id: string, @Body() dto: ReviewKycDto) {
-    return this.kyc.review(user.id, id, dto);
   }
 }

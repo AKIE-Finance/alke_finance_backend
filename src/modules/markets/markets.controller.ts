@@ -13,6 +13,7 @@ import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { RequestUser } from '../../common/types/request-user';
 
 @ApiTags('markets')
 @Controller()
@@ -29,7 +30,7 @@ export class MarketsController {
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
   @Patch('markets/:id')
-  updateMarket(@CurrentUser() user: any, @Param('id') id: string, @Body() dto: UpdateMarketDto) {
+  updateMarket(@CurrentUser() user: RequestUser, @Param('id') id: string, @Body() dto: UpdateMarketDto) {
     return this.markets.updateMarket(id, user.id, dto);
   }
 
@@ -46,7 +47,7 @@ export class MarketsController {
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
   @Post('partners')
-  createPartner(@CurrentUser() user: any, @Body() dto: CreatePartnerDto) {
+  createPartner(@CurrentUser() user: RequestUser, @Body() dto: CreatePartnerDto) {
     return this.markets.createPartner(user.id, dto);
   }
 
@@ -54,7 +55,7 @@ export class MarketsController {
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
   @Patch('partners/:id')
-  updatePartner(@CurrentUser() user: any, @Param('id') id: string, @Body() dto: UpdatePartnerDto) {
+  updatePartner(@CurrentUser() user: RequestUser, @Param('id') id: string, @Body() dto: UpdatePartnerDto) {
     return this.markets.updatePartner(id, user.id, dto);
   }
 
@@ -94,7 +95,7 @@ export class MarketsController {
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
   @Post('instruments/:id/quotes')
-  addQuote(@CurrentUser() user: any, @Param('id') id: string, @Body() dto: AddQuoteDto) {
+  addQuote(@CurrentUser() user: RequestUser, @Param('id') id: string, @Body() dto: AddQuoteDto) {
     return this.markets.addQuote(id, user.id, dto);
   }
 
@@ -102,7 +103,7 @@ export class MarketsController {
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
   @Post('markets/:marketId/quotes/bulk')
-  bulkQuotes(@CurrentUser() user: any, @Param('marketId') marketId: string, @Body() dto: BulkQuotesDto) {
+  bulkQuotes(@CurrentUser() user: RequestUser, @Param('marketId') marketId: string, @Body() dto: BulkQuotesDto) {
     return this.markets.bulkQuotes(marketId, user.id, dto);
   }
 
@@ -118,14 +119,14 @@ export class MarketsController {
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @Get('watchlist')
-  watchlist(@CurrentUser() user: any) {
+  watchlist(@CurrentUser() user: RequestUser) {
     return this.markets.watchlist(user.id);
   }
 
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @Post('watchlist/:instrumentId')
-  toggleWatch(@CurrentUser() user: any, @Param('instrumentId') instrumentId: string) {
+  toggleWatch(@CurrentUser() user: RequestUser, @Param('instrumentId') instrumentId: string) {
     return this.markets.toggleWatch(user.id, instrumentId);
   }
 }

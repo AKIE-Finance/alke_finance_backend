@@ -12,7 +12,7 @@ import { Roles } from '../../common/decorators/roles.decorator';
 @Roles(UserRole.ADMIN, UserRole.COMPLIANCE)
 @Controller('admin')
 export class AdminController {
-  constructor(private admin: AdminService) {}
+  constructor(private readonly admin: AdminService) {}
 
   @Get('stats')
   stats() {
@@ -20,7 +20,27 @@ export class AdminController {
   }
 
   @Get('audit-log')
-  auditLog(@Query('entityType') entityType?: string) {
-    return this.admin.auditLog(entityType);
+  auditLog(
+    @Query('entityType') entityType?: string,
+    @Query('action') action?: string,
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    return this.admin.auditLog({
+      entityType,
+      action,
+      from,
+      to,
+      page: page === undefined ? undefined : Number(page),
+      pageSize: pageSize === undefined ? undefined : Number(pageSize),
+    });
+  }
+
+  /** Recomputes the whole hash chain (blueprint §4.10). */
+  @Get('audit-log/verify')
+  verify() {
+    return this.admin.verifyAuditChain();
   }
 }

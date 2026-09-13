@@ -1,5 +1,8 @@
-import { IsEmail, IsEnum, IsOptional, IsPhoneNumber, IsString, MinLength } from 'class-validator';
+import { IsEmail, IsEnum, IsOptional, IsString, Matches, MinLength } from 'class-validator';
 import { SupportedCountry } from '@prisma/client';
+
+/** E.164 : indicatif international obligatoire, 8 à 15 chiffres au total. */
+export const E164_REGEX = /^\+[1-9]\d{7,14}$/;
 
 export class RegisterDto {
   @IsString()
@@ -9,7 +12,7 @@ export class RegisterDto {
   @IsEmail()
   email: string;
 
-  @IsString()
+  @Matches(E164_REGEX, { message: 'Le numéro doit être au format international (ex. +2376XXXXXXXX).' })
   phone: string;
 
   @IsEnum(SupportedCountry)
@@ -22,4 +25,12 @@ export class RegisterDto {
   @IsOptional()
   @IsString()
   referralCode?: string;
+
+  @IsOptional()
+  @IsString()
+  deviceId?: string;
+
+  @IsOptional()
+  @IsString()
+  deviceLabel?: string;
 }

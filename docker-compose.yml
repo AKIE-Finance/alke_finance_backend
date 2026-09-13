@@ -1,3 +1,7 @@
+# Local development stack. Ports are deliberately non-default (55432 / 55380)
+# because this machine runs other PostgreSQL instances on 5432/5433.
+# `docker compose up -d` starts the databases only; add `--profile api` to also
+# run the API from the production Dockerfile (migrations + seed on first start).
 services:
   postgres:
     image: postgres:16-alpine
@@ -23,10 +27,37 @@ services:
     image: redis:7-alpine
     container_name: alke_finance_redis
     restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
     ports:
       - "55380:6379"
     volumes:
       - alke_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    profiles: ["api"]
+    build:
+      context: .
+      args:
+        APP_VERSION: local
+    container_name: alke_finance_api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://alke:alke_dev_local_only@postgres:5432/alke_finance_dev?schema=public
+      REDIS_URL: redis://redis:6379
+      RUN_MIGRATIONS: "true"
+      RUN_SEED: "true"
+    ports:
+      - "3000:3000"
 
 volumes:
   alke_pg_data:

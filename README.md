@@ -13,15 +13,35 @@ abonnement AlKÉ Pro, préférences de notification, journal d'audit.
 
 ```bash
 docker compose up -d          # PostgreSQL (port 55432) + Redis (port 55380)
-npm install
-npx prisma migrate dev        # crée le schéma
-npx ts-node prisma/seed.ts    # marchés, partenaires (pipeline), frais, admin
-npm run start:dev             # http://localhost:3000  (docs Swagger: /docs)
+cp .env.example .env          # APP_ENV=local, OTP démo activé, paiements simulés
+pnpm install                  # pnpm est le gestionnaire déclaré (package.json "packageManager")
+pnpm prisma migrate dev       # crée le schéma
+pnpm seed                     # marchés, partenaires, frais, admin (ADMIN_SEED_EMAIL / ADMIN_SEED_PASSWORD du .env)
+pnpm start:dev                # http://localhost:3000  (docs Swagger : /docs, santé : /health, /health/ready)
 ```
 
-Identifiants admin de démo créés par le seed : `admin@alke.finance` /
-`ChangeMe!2026` — **à changer immédiatement**, ce n'est qu'un compte de
-développement local.
+Ou tout-en-un depuis l'image de production : `docker compose --profile api up --build`.
+
+L'administrateur de démo est créé à partir de `ADMIN_SEED_EMAIL` /
+`ADMIN_SEED_PASSWORD` (voir `.env.example`) ; le seed refuse de créer un admin
+en production sans `SEED_ADMIN_IN_PROD=true`. Les variables d'environnement sont
+validées au démarrage (`src/config/env.validation.ts`) : hors `APP_ENV=local`,
+le mode OTP démo est refusé, `JWT_SECRET` doit faire au moins 32 caractères et
+`CORS_ORIGINS` est obligatoire.
+
+## Infrastructure
+
+- `Dockerfile` : image de production (Node 24, pnpm, Prisma). La même image
+  exécute les migrations avec `RUN_MIGRATIONS=true` (tâche ECS ponctuelle).
+- `.github/workflows/ci.yml` : validation du schéma, compilation, application
+  des migrations sur une base vierge, contrôle de dérive schéma/migrations,
+  seed, tests, construction de l'image ; déploiement staging sur `main` si le
+  rôle AWS OIDC est configuré.
+- `infra/terraform` : VPC, RDS PostgreSQL 16, ElastiCache Redis, ECS Fargate +
+  ALB, ECR, Secrets Manager, stockage privé des pièces d'identité, alarmes.
+  Région et localisation des données personnelles selon le blueprint v3.2 (D16).
+- `infra/README.md` : environnements, secrets, sauvegardes, procédure de
+  restauration, runbook d'incident, observabilité.
 
 ## Pourquoi les ports 55432/55380 ?
 

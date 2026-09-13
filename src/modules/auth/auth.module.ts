@@ -15,12 +15,13 @@ import { JwtStrategy } from './strategies/jwt.strategy';
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
         secret: config.get<string>('JWT_SECRET'),
-        signOptions: { expiresIn: config.get<string>('JWT_EXPIRES_IN') || '7d' },
+        // Blueprint §4.10 : jeton d'accès court ; la persistance passe par le refresh token.
+        signOptions: { expiresIn: config.get<string>('JWT_EXPIRES_IN') || '15m' },
       }),
     }),
   ],
   providers: [AuthService, OtpService, JwtStrategy],
   controllers: [AuthController],
-  exports: [OtpService],
+  exports: [AuthService, OtpService],
 })
 export class AuthModule {}

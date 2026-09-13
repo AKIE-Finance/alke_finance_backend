@@ -1,6 +1,6 @@
 import { Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { TicketStatus, UserRole } from '@prisma/client';
+import { TicketAuthorType, TicketStatus, UserRole } from '@prisma/client';
 import { SupportService } from './support.service';
 import { CreateTicketDto } from './dto/create-ticket.dto';
 import { AddMessageDto } from './dto/add-message.dto';
@@ -9,6 +9,7 @@ import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { RequestUser } from '../../common/types/request-user';
 
 @ApiTags('support')
 @ApiBearerAuth()
@@ -18,18 +19,18 @@ export class SupportController {
   constructor(private support: SupportService) {}
 
   @Post('support/tickets')
-  create(@CurrentUser() user: any, @Body() dto: CreateTicketDto) {
+  create(@CurrentUser() user: RequestUser, @Body() dto: CreateTicketDto) {
     return this.support.createTicket(user.id, dto);
   }
 
   @Get('support/tickets/me')
-  mine(@CurrentUser() user: any) {
+  mine(@CurrentUser() user: RequestUser) {
     return this.support.listMine(user.id);
   }
 
   @Post('support/tickets/:id/messages')
-  addMessage(@CurrentUser() user: any, @Param('id') id: string, @Body() dto: AddMessageDto) {
-    return this.support.addMessage(user.id, id, 'USER', dto);
+  addMessage(@CurrentUser() user: RequestUser, @Param('id') id: string, @Body() dto: AddMessageDto) {
+    return this.support.addMessage(user.id, id, TicketAuthorType.USER, dto);
   }
 
   @UseGuards(RolesGuard)
@@ -42,8 +43,8 @@ export class SupportController {
   @UseGuards(RolesGuard)
   @Roles(UserRole.ADMIN, UserRole.SUPPORT)
   @Post('admin/support/tickets/:id/messages')
-  addAgentMessage(@CurrentUser() user: any, @Param('id') id: string, @Body() dto: AddMessageDto) {
-    return this.support.addMessage(user.id, id, 'AGENT', dto);
+  addAgentMessage(@CurrentUser() user: RequestUser, @Param('id') id: string, @Body() dto: AddMessageDto) {
+    return this.support.addMessage(user.id, id, TicketAuthorType.AGENT, dto);
   }
 
   @UseGuards(RolesGuard)

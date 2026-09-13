@@ -1,12 +1,12 @@
-import { IsEnum, IsOptional, IsString, ValidateIf } from 'class-validator';
-import { KycStatus } from '@prisma/client';
+import { IsIn, IsOptional, IsString, MaxLength } from 'class-validator';
 
+/** Legacy console contract (POST /kyc/submissions/:id/review): VERIFIED maps to VALIDATED. */
 export class ReviewKycDto {
-  @IsEnum(KycStatus)
-  status: KycStatus; // VERIFIED ou REJECTED attendu ici
+  @IsIn(['VERIFIED', 'VALIDATED', 'REJECTED'], { message: 'Le statut de revue doit être VERIFIED/VALIDATED ou REJECTED.' })
+  status: 'VERIFIED' | 'VALIDATED' | 'REJECTED';
 
-  @ValidateIf((o) => o.status === 'REJECTED')
-  @IsString()
   @IsOptional()
+  @IsString()
+  @MaxLength(1000)
   rejectionReason?: string;
 }

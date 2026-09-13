@@ -1,4 +1,4 @@
-import { IsEnum, IsString } from 'class-validator';
+import { IsEnum, IsOptional, IsString } from 'class-validator';
 import { OtpPurpose } from '@prisma/client';
 
 export class VerifyOtpDto {
@@ -10,4 +10,12 @@ export class VerifyOtpDto {
 
   @IsString()
   code: string;
+
+  @IsOptional()
+  @IsString()
+  deviceId?: string;
+
+  @IsOptional()
+  @IsString()
+  deviceLabel?: string;
 }

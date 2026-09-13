@@ -1,9 +1,10 @@
 // AlKÉ Finance — schéma de base de données (PostgreSQL)
-// Couvre : authentification, KYC, wallet/FX, catalogue multi-marché,
-// moteur d'ordres multi-marché (BVMAC/BRVM), pipeline de partenaires
-// boursiers (SDB/SGI), back-office, conformité/audit.
-// Référence documentaire : ALKE-CDC-2026-001, ALKE-BACKEND-2026-001,
-// ALKE-BOURSE-2026-001/002.
+// Version blueprint v3.2 (§4.2) : grand livre en partie double immuable,
+// intentions de paiement, machine à états des ordres avec lots/ACK/EXE et
+// règlement-livraison, réconciliation, maker-checker, conformité, journal
+// d'audit chaîné. Les soldes ne sont jamais stockés comme champs mutables.
+// Référence documentaire : ALKE-ANALYSE-2026-003 rev. 2, ALKE-CDC-2026-001,
+// ALKE-BOURSE-2026-001.
 
 generator client {
   provider = "prisma-client-js"
@@ -26,24 +27,29 @@ enum UserRole {
 }
 
 enum SupportedCountry {
-  CIV // Côte d'Ivoire (BRVM / CREPMF)
-  SEN // Sénégal (BRVM / CREPMF)
-  TGO // Togo (BRVM / CREPMF)
-  BEN // Bénin (BRVM / CREPMF)
-  BFA // Burkina Faso (BRVM / CREPMF)
-  MLI // Mali (BRVM / CREPMF)
-  CMR // Cameroun (BVMAC / COSUMAF)
-  GAB // Gabon (BVMAC / COSUMAF)
-  COG // Congo (BVMAC / COSUMAF)
-  INTL // Diaspora / international
+  CIV
+  SEN
+  TGO
+  BEN
+  BFA
+  MLI
+  CMR
+  GAB
+  COG
+  GNQ // Guinée équatoriale (BVMAC)
+  INTL
 }
 
+// Cycle KYC du blueprint §4.7
 enum KycStatus {
   NOT_STARTED
-  PENDING
-  IN_REVIEW
-  VERIFIED
+  DRAFT
+  SUBMITTED
+  AUTO_APPROVED
+  MANUAL_REVIEW
+  VALIDATED
   REJECTED
+  RE_KYC
 }
 
 enum RiskProfile {
@@ -53,50 +59,78 @@ enum RiskProfile {
 }
 
 model User {
-  id                String      @id @default(uuid())
-  fullName          String
-  email             String      @unique
-  phone             String      @unique
-  passwordHash      String
-  country           SupportedCountry
-  displayCurrency   String      @default("XOF")
-  role              UserRole    @default(USER)
-  kycStatus         KycStatus   @default(NOT_STARTED)
+  id                 String           @id @default(uuid())
+  fullName           String
+  email              String           @unique
+  phone              String           @unique
+  passwordHash       String
+  country            SupportedCountry
+  displayCurrency    String           @default("XAF")
+  role               UserRole         @default(USER)
+  kycStatus          KycStatus        @default(NOT_STARTED)
   kycRejectionReason String?
-  riskProfile       RiskProfile?
-  twoFactorEnabled  Boolean     @default(false)
-  biometricEnabled  Boolean     @default(false)
-  avatarSeed        String?
-  referralCode      String      @unique
-  referredById      String?
-  referredBy        User?       @relation("Referrals", fields: [referredById], references: [id])
-  referredUsers     User[]      @relation("Referrals")
-  isBlocked         Boolean     @default(false)
+  kycResubmissions   Int              @default(0)
+  kycValidatedAt     DateTime?
+  riskProfile        RiskProfile?
+  twoFactorEnabled   Boolean          @default(false)
+  biometricEnabled   Boolean          @default(false)
+  avatarSeed         String?
+  referralCode       String           @unique
+  referredById       String?
+  referredBy         User?            @relation("Referrals", fields: [referredById], references: [id])
+  referredUsers      User[]           @relation("Referrals")
+  isBlocked          Boolean          @default(false)
   blockedReason      String?
-  createdAt         DateTime    @default(now())
-  updatedAt         DateTime    @updatedAt
+  // Incrémenté à chaque réinitialisation de mot de passe / révocation globale :
+  // tout JWT portant une version inférieure est refusé.
+  tokenVersion       Int              @default(0)
+  passwordChangedAt  DateTime?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
 
-  kycSubmissions    KycSubmission[]
-  accounts          Account[]
-  orders            Order[]
-  positions         Position[]
-  watchlist         WatchlistItem[]
-  externalHoldings  ExternalHolding[]
-  recurringPlans    RecurringPlan[]
-  subscription      Subscription?
-  notificationPref  NotificationPreference?
-  notifications     Notification[]
-  supportTickets    SupportTicket[]
-  npsResponses      NpsResponse[]
-  devices           UserDevice[]
-  referralsMade     Referral[]  @relation("ReferralReferrer")
-  referralReceived  Referral?   @relation("ReferralReferee")
-  auditLogsAsActor  AuditLog[]  @relation("AuditActor")
-  reviewedKyc       KycSubmission[] @relation("KycReviewer")
+  sessions           Session[]
+  kycSubmissions     KycSubmission[]
+  brokerAccounts     BrokerAccount[]
+  paymentIntents     PaymentIntent[]
+  orders             Order[]
+  positions          Position[]
+  watchlist          WatchlistItem[]
+  externalHoldings   ExternalHolding[]
+  recurringPlans     RecurringPlan[]
+  subscription       Subscription?
+  notificationPref   NotificationPreference?
+  notifications      Notification[]
+  supportTickets     SupportTicket[]
+  npsResponses       NpsResponse[]
+  devices            UserDevice[]
+  referralsMade      Referral[]       @relation("ReferralReferrer")
+  referralReceived   Referral?        @relation("ReferralReferee")
+  auditLogsAsActor   AuditLog[]       @relation("AuditActor")
+  reviewedKyc        KycSubmission[]  @relation("KycReviewer")
+  approvalsMade      PendingApproval[] @relation("ApprovalMaker")
+  approvalsChecked   PendingApproval[] @relation("ApprovalChecker")
+  complianceCases    ComplianceCase[] @relation("ComplianceSubject")
 
-  @@index([email])
-  @@index([phone])
   @@index([kycStatus])
+  @@index([role])
+}
+
+// Jetons de rafraîchissement (blueprint §4.10 : accès 15 min + refresh, device binding).
+model Session {
+  id               String    @id @default(uuid())
+  userId           String
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshTokenHash String    @unique
+  deviceId         String?
+  deviceLabel      String?
+  ipAddress        String?
+  userAgent        String?
+  expiresAt        DateTime
+  lastUsedAt       DateTime  @default(now())
+  revokedAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  @@index([userId, revokedAt])
 }
 
 enum OtpPurpose {
@@ -109,15 +143,15 @@ enum OtpPurpose {
 
 model OtpCode {
   id          String     @id @default(uuid())
-  destination String // e-mail ou téléphone ciblé
+  destination String
   purpose     OtpPurpose
-  code        String
+  codeHash    String // sha256(code + destination + purpose) — jamais le code en clair
   expiresAt   DateTime
   consumedAt  DateTime?
   attempts    Int        @default(0)
   createdAt   DateTime   @default(now())
 
-  @@index([destination, purpose])
+  @@index([destination, purpose, createdAt])
 }
 
 model UserDevice {
@@ -126,6 +160,7 @@ model UserDevice {
   user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   label        String
   platform     String
+  pushToken    String?
   lastActiveAt DateTime @default(now())
   createdAt    DateTime @default(now())
 
@@ -133,7 +168,7 @@ model UserDevice {
 }
 
 // =========================================================================
-// 2. KYC (MODULE 1)
+// 2. KYC (blueprint §4.7)
 // =========================================================================
 
 enum DocumentType {
@@ -143,117 +178,156 @@ enum DocumentType {
 }
 
 model KycSubmission {
-  id                 String      @id @default(uuid())
-  userId             String
-  user               User        @relation(fields: [userId], references: [id], onDelete: Cascade)
-  status             KycStatus   @default(PENDING)
-  documentType       DocumentType?
-  documentFrontUrl   String?
-  documentBackUrl    String?
-  selfieUrl          String?
-  questionnaire      Json? // profil investisseur, tolérance au risque, origine des fonds
-  rejectionReason    String?
-  submittedAt        DateTime    @default(now())
-  reviewedAt         DateTime?
-  reviewedByAdminId  String?
-  reviewedByAdmin    User?       @relation("KycReviewer", fields: [reviewedByAdminId], references: [id])
+  id                String        @id @default(uuid())
+  userId            String
+  user              User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status            KycStatus     @default(DRAFT)
+  documentType      DocumentType?
+  documentCountry   String?
+  // Clés d'objets dans le stockage privé des pièces (jamais des URL publiques).
+  documentFrontKey  String?
+  documentBackKey   String?
+  selfieKey         String?
+  questionnaire     Json?
+  providerRef       String? // référence Smile ID
+  livenessScore     Decimal?      @db.Decimal(5, 2)
+  screeningResult   Json? // sanctions / PEP
+  autoDecision      Boolean       @default(false)
+  rejectionReason   String?
+  submittedAt       DateTime?
+  decidedAt         DateTime?
+  reviewedByAdminId String?
+  reviewedByAdmin   User?         @relation("KycReviewer", fields: [reviewedByAdminId], references: [id])
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
 
   @@index([userId])
   @@index([status])
 }
 
 // =========================================================================
-// 3. MARCHÉS, PARTENAIRES BOURSIERS (SDB / SGI), CATALOGUE
-//    Référence : ALKE-BOURSE-2026-001 (BVMAC) & -002 (multi-marchés, AELP)
+// 3. MARCHÉS, PARTENAIRES (SDB / SGI), CATALOGUE, COMPTES-TITRES
 // =========================================================================
 
 enum MarketCode {
-  BVMAC // zone CEMAC — COSUMAF
-  BRVM // zone UEMOA — CREPMF
-  INTL // international (Twelve Data)
-  NGX // Nigeria — extension future (roadmap §3.2)
-  NSE // Kenya — extension future
-  EGX // Égypte — extension future
-  JSE // Afrique du Sud — extension future
-  CASABLANCA // Maroc — extension future
-  SEM // Maurice — extension future
+  BVMAC
+  BRVM
+  INTL
+  NGX
+  NSE
+  EGX
+  JSE
+  CASABLANCA
+  SEM
 }
 
 enum MarketStatus {
-  SIMULATED_ONLY // Palier 0 — aucun partenaire actif, ordres toujours simulés
-  PARTNER_IN_PROGRESS // négociation en cours avec un partenaire
-  LIVE // partenaire actif, exécution réelle possible
+  SIMULATED_ONLY
+  PARTNER_IN_PROGRESS
+  LIVE
 }
 
 model Market {
-  id          String       @id @default(uuid())
-  code        MarketCode   @unique
-  name        String
-  zone        String // ex. "Zone CEMAC", "Zone UEMOA"
-  currency    String
-  regulator   String // ex. COSUMAF, CREPMF, SEC Nigeria...
-  status      MarketStatus @default(SIMULATED_ONLY)
+  id               String       @id @default(uuid())
+  code             MarketCode   @unique
+  name             String
+  zone             String
+  currency         String
+  regulator        String
+  status           MarketStatus @default(SIMULATED_ONLY)
+  // Interrupteur légal (blueprint §4.1) : ne passe à true que par maker-checker.
+  liveTrading      Boolean      @default(false)
+  timezone         String       @default("Africa/Douala")
+  // BVMAC : un fixing par jour à 11:00 ; le lot part avant le cut-off.
+  cutoffTime       String       @default("09:30")
+  sessionsJson     Json?
+  settlementDays   Int          @default(3)
   openingHoursNote String?
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
 
-  instruments Instrument[]
-  partners    MarketPartner[]
-  orders      Order[]
-  feeSchedules FeeSchedule[]
-  ingestionLogs MarketDataIngestionLog[]
+  instruments    Instrument[]
+  partners       MarketPartner[]
+  orders         Order[]
+  batches        OrderBatch[]
+  feeSchedules   FeeSchedule[]
+  ingestionLogs  MarketDataIngestionLog[]
 }
 
 enum PartnerType {
-  SDB // Société de Bourse — BVMAC / COSUMAF
-  SGI // Société de Gestion et d'Intermédiation — BRVM / CREPMF
-  BROKER // marchés anglophones (NGX, NSE, EGX, JSE...)
+  SDB
+  SGI
+  BROKER
 }
 
-// Statut de la démarche de partenariat, tel que suivi dans le guide
-// ALKE-BOURSE-2026-001 (§6-9) et -002 (§7-9). C'est le "CRM" interne du
-// démarchage boursier — directement exploitable au jour le jour.
 enum PartnerAgreementStatus {
-  PROSPECT // identifié, pas encore contacté
-  CONTACTED // premier contact envoyé
+  PROSPECT
+  CONTACTED
   MEETING_SCHEDULED
-  IN_DISCUSSION // grille de questions envoyée / échanges en cours
-  TERM_SHEET // conditions en cours de négociation
-  SIGNED // convention signée
-  ACTIVE // opérationnel (ordres réellement transmis)
-  DECLINED // partenariat écarté
+  IN_DISCUSSION
+  TERM_SHEET
+  SIGNED
+  ACTIVE
+  DECLINED
 }
 
-// Palier d'intégration technique — Guide ALKE-BOURSE-2026-001 §8 / -002 §9
 enum IntegrationTier {
-  TIER0_SIMULATED // aucun canal, ordres simulés
-  TIER1_FILE // fichier/e-mail sécurisé, exécution manuelle côté partenaire
-  TIER2_BACKOFFICE_LINK // SFTP / webhook privé
-  TIER3_API // API partenaire dédiée ou AELP Link
+  TIER0_SIMULATED
+  TIER1_FILE
+  TIER2_BACKOFFICE_LINK
+  TIER3_API
 }
 
 model MarketPartner {
-  id                String                 @id @default(uuid())
-  marketId          String
-  market            Market                 @relation(fields: [marketId], references: [id])
-  name              String
-  type              PartnerType
-  agreementStatus   PartnerAgreementStatus @default(PROSPECT)
-  integrationTier   IntegrationTier        @default(TIER0_SIMULATED)
-  aelpParticipant   Boolean                @default(false) // participe à l'AELP (§4.4 du guide multi-marchés)
-  contactName       String?
-  contactEmail      String?
-  contactPhone      String?
-  notes             String? // compte-rendu de rendez-vous, points en négociation
-  agreementNumber   String? // ex. n° d'agrément COSUMAF quand connu
-  lastContactAt     DateTime?
-  createdAt         DateTime               @default(now())
-  updatedAt         DateTime               @updatedAt
+  id              String                 @id @default(uuid())
+  marketId        String
+  market          Market                 @relation(fields: [marketId], references: [id])
+  code            String? // code court utilisé dans les noms de fichiers ALKE_<SDBCODE>_...
+  name            String
+  type            PartnerType
+  agreementStatus PartnerAgreementStatus @default(PROSPECT)
+  integrationTier IntegrationTier        @default(TIER0_SIMULATED)
+  aelpParticipant Boolean                @default(false)
+  contactName     String?
+  contactEmail    String?
+  contactPhone    String?
+  notes           String?
+  agreementNumber String?
+  lastContactAt   DateTime?
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
 
-  orders            Order[]
+  orders         Order[]
+  batches        OrderBatch[]
+  brokerAccounts BrokerAccount[]
 
   @@index([marketId])
   @@index([agreementStatus])
+}
+
+enum BrokerAccountState {
+  REQUESTED
+  OPEN
+  SUSPENDED
+  CLOSED
+}
+
+// Compte-titres individuel ouvert chez la SDB via le dossier KYC ALKÉ (A4).
+model BrokerAccount {
+  id                String             @id @default(uuid())
+  userId            String
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  partnerId         String
+  partner           MarketPartner      @relation(fields: [partnerId], references: [id])
+  externalAccountNo String?
+  state             BrokerAccountState @default(REQUESTED)
+  requestedAt       DateTime           @default(now())
+  openedAt          DateTime?
+  suspendedAt       DateTime?
+  notes             String?
+
+  @@unique([userId, partnerId])
+  @@index([state])
 }
 
 enum AssetClass {
@@ -262,35 +336,36 @@ enum AssetClass {
 }
 
 model Instrument {
-  id             String     @id @default(uuid())
-  marketId       String
-  market         Market     @relation(fields: [marketId], references: [id])
-  symbol         String
-  name           String
-  assetClass     AssetClass
-  sector         String?
-  currency       String
-  isActive       Boolean    @default(true)
+  id              String     @id @default(uuid())
+  marketId        String
+  market          Market     @relation(fields: [marketId], references: [id])
+  symbol          String
+  isin            String?    @unique
+  name            String
+  assetClass      AssetClass
+  sector          String?
+  currency        String
+  isActive        Boolean    @default(true)
+  lotSize         Int        @default(1)
+  tickSize        Decimal?   @db.Decimal(18, 4)
 
-  // Actions
-  lastPrice      Decimal?   @db.Decimal(18, 4)
-  previousClose  Decimal?   @db.Decimal(18, 4)
-  dayHigh        Decimal?   @db.Decimal(18, 4)
-  dayLow         Decimal?   @db.Decimal(18, 4)
-  week52High     Decimal?   @db.Decimal(18, 4)
-  week52Low      Decimal?   @db.Decimal(18, 4)
-  marketCap      Decimal?   @db.Decimal(20, 2)
-  per            Decimal?   @db.Decimal(10, 2)
-  dividendYield  Decimal?   @db.Decimal(6, 3)
+  lastPrice       Decimal?   @db.Decimal(18, 4)
+  previousClose   Decimal?   @db.Decimal(18, 4)
+  dayHigh         Decimal?   @db.Decimal(18, 4)
+  dayLow          Decimal?   @db.Decimal(18, 4)
+  week52High      Decimal?   @db.Decimal(18, 4)
+  week52Low       Decimal?   @db.Decimal(18, 4)
+  marketCap       Decimal?   @db.Decimal(20, 2)
+  per             Decimal?   @db.Decimal(10, 2)
+  dividendYield   Decimal?   @db.Decimal(6, 3)
 
-  // Obligations
-  couponRate     Decimal?   @db.Decimal(6, 3)
-  maturityDate   DateTime?
-  nominalPrice   Decimal?   @db.Decimal(18, 4)
-  minSubscription Decimal?  @db.Decimal(18, 2)
+  couponRate      Decimal?   @db.Decimal(6, 3)
+  maturityDate    DateTime?
+  nominalPrice    Decimal?   @db.Decimal(18, 4)
+  minSubscription Decimal?   @db.Decimal(18, 2)
 
-  createdAt      DateTime   @default(now())
-  updatedAt      DateTime   @updatedAt
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
 
   quoteHistory   InstrumentQuote[]
   orders         Order[]
@@ -302,37 +377,33 @@ model Instrument {
   @@index([assetClass])
 }
 
-// Historique de cours — alimenté soit par le job de traitement du Bulletin
-// Officiel de Cotation (BVMAC/BRVM), soit par Twelve Data (INTL).
 model InstrumentQuote {
   id           String     @id @default(uuid())
   instrumentId String
   instrument   Instrument @relation(fields: [instrumentId], references: [id], onDelete: Cascade)
-  tradeDate    DateTime
+  tradeDate    DateTime   @db.Date
   open         Decimal    @db.Decimal(18, 4)
   high         Decimal    @db.Decimal(18, 4)
   low          Decimal    @db.Decimal(18, 4)
   close        Decimal    @db.Decimal(18, 4)
   volume       BigInt?
-  source       String // "BOC_MANUAL" | "BOC_INGEST" | "TWELVE_DATA"
+  source       String // BOC | SDB | MANUAL | TWELVE_DATA
   createdAt    DateTime   @default(now())
 
   @@unique([instrumentId, tradeDate])
-  @@index([instrumentId, tradeDate])
 }
 
-// Traçabilité de chaque import de cours (manuel ou automatisé) — cf. Guide
-// ALKE-BOURSE-2026-001 §8.1 (traitement du Bulletin Officiel de Cotation).
 model MarketDataIngestionLog {
-  id             String   @id @default(uuid())
-  marketId       String
-  market         Market   @relation(fields: [marketId], references: [id])
-  source         String // "BOC_MANUAL_ENTRY" | "BOC_FILE_UPLOAD" | "TWELVE_DATA"
+  id                 String   @id @default(uuid())
+  marketId           String
+  market             Market   @relation(fields: [marketId], references: [id])
+  source             String
   performedByAdminId String?
-  rowsProcessed  Int      @default(0)
-  rowsFailed     Int      @default(0)
-  notes          String?
-  createdAt      DateTime @default(now())
+  rowsProcessed      Int      @default(0)
+  rowsFailed         Int      @default(0)
+  layoutFingerprint  String?
+  notes              String?
+  createdAt          DateTime @default(now())
 
   @@index([marketId])
 }
@@ -349,42 +420,104 @@ model WatchlistItem {
 }
 
 // =========================================================================
-// 4. WALLET, PAIEMENT, FX (MODULE 2)
+// 4. GRAND LIVRE EN PARTIE DOUBLE (blueprint §4.4) — la seule source de vérité
+//    pour tout solde. Aucune table ne stocke un solde mutable.
 // =========================================================================
 
-model Account {
-  id        String   @id @default(uuid())
-  userId    String
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+enum LedgerOwnerType {
+  USER // ownerId = User.id
+  SDB // ownerId = MarketPartner.id (compte espèces clientèle miroir)
+  ALKE // ownerId = "SYSTEM" (commissions ALKÉ)
+  FEE // ownerId = code de frais (COURTAGE_SDB, COMMISSION_ALKE, FX_SPREAD, TAXE)
+  PROVIDER // ownerId = PaymentProvider (compte de passage collections/décaissements)
+  TAX // ownerId = "SYSTEM"
+}
+
+enum LedgerAccountKind {
+  AVAILABLE
+  RESERVED
+  SETTLING
+  WITHDRAWABLE
+  CLEARING
+}
+
+model LedgerAccount {
+  id        String            @id @default(uuid())
+  ownerType LedgerOwnerType
+  ownerId   String
   currency  String
-  balance   Decimal  @default(0) @db.Decimal(18, 2)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  kind      LedgerAccountKind
+  createdAt DateTime          @default(now())
 
-  transactions WalletTransaction[]
+  entries LedgerEntry[]
 
-  @@unique([userId, currency])
+  @@unique([ownerType, ownerId, currency, kind])
+  @@index([ownerType, ownerId])
 }
 
-enum WalletTransactionType {
+enum LedgerTxnType {
   DEPOSIT
-  WITHDRAWAL
-  FX_CONVERT_IN
-  FX_CONVERT_OUT
-  ORDER_DEBIT
-  ORDER_CREDIT
+  RESERVE
+  RELEASE
+  FILL
   FEE
-  DIVIDEND
-  COUPON
-  REFERRAL_REWARD
+  TAX
+  SETTLEMENT
+  WITHDRAWAL
+  ADJUST
+  REVERSAL
 }
 
-enum WalletTransactionStatus {
-  PENDING
-  COMPLETED
-  FAILED
-  CANCELLED
+enum LedgerTxnStatus {
+  POSTED
+  REVERSED
 }
+
+model LedgerTxn {
+  id                String          @id @default(uuid())
+  type              LedgerTxnType
+  status            LedgerTxnStatus @default(POSTED)
+  // Dérivée du déclencheur (id d'intention, id d'ordre, ligne de lot) : un
+  // webhook rejoué ou un job relancé ne peut pas poster deux fois.
+  idempotencyKey    String          @unique
+  externalReference String?
+  source            String // PAYMENT_WEBHOOK | ORDER | EXE_FILE | CSH_FILE | ADMIN | JOB
+  actorId           String?
+  refType           String? // PaymentIntent | Order | Execution | ReconciliationItem | PendingApproval
+  refId             String?
+  currency          String
+  description       String?
+  metadata          Json?
+  reversalOfId      String?         @unique
+  reversalOf        LedgerTxn?      @relation("Reversal", fields: [reversalOfId], references: [id])
+  reversedBy        LedgerTxn?      @relation("Reversal")
+  createdById       String?
+  createdAt         DateTime        @default(now())
+  postedAt          DateTime        @default(now())
+
+  entries LedgerEntry[]
+
+  @@index([refType, refId])
+  @@index([type, postedAt])
+}
+
+// Immuable : jamais UPDATE, jamais DELETE. Solde = SUM(amount) par compte.
+model LedgerEntry {
+  id        String        @id @default(uuid())
+  txnId     String
+  txn       LedgerTxn     @relation(fields: [txnId], references: [id])
+  accountId String
+  account   LedgerAccount @relation(fields: [accountId], references: [id])
+  amount    Decimal       @db.Decimal(18, 2) // signé ; la somme d'une transaction vaut zéro
+  createdAt DateTime      @default(now())
+
+  @@index([accountId, createdAt])
+  @@index([txnId])
+}
+
+// =========================================================================
+// 5. PAIEMENTS — INTENTIONS ET RÉCONCILIATION (blueprint §3.2, §4.8, §4.16)
+// =========================================================================
 
 enum PaymentProvider {
   MTN_MOMO
@@ -392,44 +525,86 @@ enum PaymentProvider {
   CINETPAY
   PAYDUNYA
   BANK_TRANSFER
-  INTERNAL
+  SIMULATED
 }
 
-model WalletTransaction {
-  id                String                   @id @default(uuid())
-  accountId         String
-  account           Account                  @relation(fields: [accountId], references: [id], onDelete: Cascade)
-  type              WalletTransactionType
-  amount            Decimal                  @db.Decimal(18, 2)
-  status            WalletTransactionStatus  @default(PENDING)
-  provider          PaymentProvider          @default(INTERNAL)
-  providerReference String?
-  feeAmount         Decimal                  @default(0) @db.Decimal(18, 2)
-  note              String?
-  createdAt         DateTime                 @default(now())
-  completedAt       DateTime?
-
-  @@index([accountId])
-  @@index([status])
+enum PaymentDirection {
+  IN // dépôt : collecte vers le compte espèces clientèle de la SDB
+  OUT // retrait : décaissement par la SDB (fichier WDR) ou son mandataire
 }
 
-model FxConversion {
-  id           String   @id @default(uuid())
-  userId       String
-  fromCurrency String
-  toCurrency   String
-  fromAmount   Decimal  @db.Decimal(18, 2)
-  toAmount     Decimal  @db.Decimal(18, 2)
-  rateApplied  Decimal  @db.Decimal(18, 8)
-  createdAt    DateTime @default(now())
+enum PaymentIntentState {
+  CREATED
+  PENDING // demande envoyée au fournisseur / instruction WDR émise
+  PAID
+  FAILED
+  EXPIRED
+  CANCELLED
+}
 
-  @@index([userId])
+model PaymentIntent {
+  id             String             @id @default(uuid())
+  userId         String
+  user           User               @relation(fields: [userId], references: [id])
+  direction      PaymentDirection
+  provider       PaymentProvider
+  amount         Decimal            @db.Decimal(18, 2)
+  currency       String
+  // Référence = id de l'intention, générée côté serveur, transmise au fournisseur.
+  reference      String             @unique
+  state          PaymentIntentState @default(CREATED)
+  msisdn         String?
+  providerRef    String?
+  providerStatus String?
+  webhookPayload Json?
+  failureReason  String?
+  expiresAt      DateTime
+  confirmedAt    DateTime?
+  ledgerTxnId    String?
+  batchId        String? // retraits : lot WDR
+  batch          OrderBatch?        @relation(fields: [batchId], references: [id])
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([state, expiresAt])
+  @@index([provider, providerRef])
+}
+
+enum ReconciliationSource {
+  SDB_STATEMENT // fichier CSH
+  PROVIDER // relevé de règlement du fournisseur de paiement
+  EXE_FILE
+}
+
+enum ReconciliationState {
+  OPEN
+  INVESTIGATING
+  RESOLVED
+  WRITTEN_OFF
+}
+
+model ReconciliationItem {
+  id           String               @id @default(uuid())
+  source       ReconciliationSource
+  externalRef  String
+  amount       Decimal              @db.Decimal(18, 2)
+  currency     String
+  occurredAt   DateTime?
+  rawLine      String?
+  matchedTxnId String?
+  state        ReconciliationState  @default(OPEN)
+  reason       String?
+  ownerId      String?
+  resolvedAt   DateTime?
+  createdAt    DateTime             @default(now())
+
+  @@unique([source, externalRef])
+  @@index([state])
 }
 
 // =========================================================================
-// 5. ORDRES — MOTEUR MULTI-MARCHÉ (MODULE 4)
-//    Référence : ALKE-BOURSE-2026-002 §5 — chaque ordre porte un marché et
-//    résout un partenaire ; Paliers 0-3 définis dans les guides bourse.
+// 6. ORDRES — MACHINE À ÉTATS, LOTS, EXÉCUTIONS, RÈGLEMENT (blueprint §4.3, §4.5, §4.15)
 // =========================================================================
 
 enum OrderSide {
@@ -443,55 +618,152 @@ enum OrderType {
 }
 
 enum OrderStatus {
-  PENDING // enregistré côté ALKÉ, pas encore transmis
-  TRANSMITTED // transmis au partenaire (Palier 1+)
+  PENDING // créé, espèces/titres réservés, pas encore dans un lot
+  TRANSMITTED // inclus dans un lot ORD envoyé à la SDB
+  ACKNOWLEDGED // ligne acceptée dans le fichier ACK
   PARTIALLY_EXECUTED
   EXECUTED
-  REJECTED
-  CANCELLED
+  REJECTED // refusé par la SDB (ACK) — réserve libérée
+  CANCELLED // annulé par l'utilisateur avant le lot
+  EXPIRED // aucune exécution après N séances — réserve libérée
+  ADJUSTED // correction back-office (maker-checker)
 }
 
 model Order {
-  id               String          @id @default(uuid())
-  userId           String
-  user             User            @relation(fields: [userId], references: [id])
-  instrumentId     String
-  instrument       Instrument      @relation(fields: [instrumentId], references: [id])
-  marketId         String
-  market           Market          @relation(fields: [marketId], references: [id])
-  partnerId        String? // résolu automatiquement selon le marché — null tant qu'aucun partenaire actif
-  partner          MarketPartner?  @relation(fields: [partnerId], references: [id])
-  side             OrderSide
-  orderType        OrderType       @default(MARKET)
-  quantity         Decimal         @db.Decimal(18, 4)
-  limitPrice       Decimal?        @db.Decimal(18, 4)
-  estimatedPrice   Decimal         @db.Decimal(18, 4)
-  estimatedTotal   Decimal         @db.Decimal(18, 2)
-  brokerageFee     Decimal         @default(0) @db.Decimal(18, 2)
-  status           OrderStatus     @default(PENDING)
-  executionTier    IntegrationTier @default(TIER0_SIMULATED)
-  partnerReference String? // référence donnée par le partenaire (Palier 1+)
-  rejectionReason  String?
-  submittedAt      DateTime        @default(now())
-  transmittedAt    DateTime?
-  executedAt       DateTime?
-  executedPrice    Decimal?        @db.Decimal(18, 4)
+  id                String          @id @default(uuid())
+  userId            String
+  user              User            @relation(fields: [userId], references: [id])
+  instrumentId      String
+  instrument        Instrument      @relation(fields: [instrumentId], references: [id])
+  marketId          String
+  market            Market          @relation(fields: [marketId], references: [id])
+  partnerId         String?
+  partner           MarketPartner?  @relation(fields: [partnerId], references: [id])
+  batchId           String?
+  batch             OrderBatch?     @relation(fields: [batchId], references: [id])
+  side              OrderSide
+  orderType         OrderType       @default(MARKET)
+  quantity          Decimal         @db.Decimal(18, 4)
+  limitPrice        Decimal?        @db.Decimal(18, 4)
+  estimatedPrice    Decimal         @db.Decimal(18, 4)
+  estimatedTotal    Decimal         @db.Decimal(18, 2)
+  maxAmount         Decimal         @db.Decimal(18, 2) // plafond achat frais inclus (ORD.max_amount_xaf)
+  brokerageFee      Decimal         @default(0) @db.Decimal(18, 2)
+  feesJson          Json?
+  status            OrderStatus     @default(PENDING)
+  executionTier     IntegrationTier @default(TIER0_SIMULATED)
+  simulated         Boolean         @default(false) // paper trading — jamais de réserve au grand livre
+  filledQuantity    Decimal         @default(0) @db.Decimal(18, 4)
+  avgExecutedPrice  Decimal?        @db.Decimal(18, 4)
+  reserveTxnId      String? // LedgerTxn RESERVE (espèces) — libéré/consommé à l'exécution
+  sdbRef            String?
+  rejectionReason   String?
+  validity          String          @default("DAY") // DAY | GTD:YYYYMMDD
+  expiresAfterSessions Int          @default(1)
+  submittedAt       DateTime        @default(now())
+  transmittedAt     DateTime?
+  acknowledgedAt    DateTime?
+  executedAt        DateTime?
+  cancelledAt       DateTime?
+  expiredAt         DateTime?
+  updatedAt         DateTime        @updatedAt
 
-  @@index([userId])
-  @@index([marketId])
-  @@index([status])
+  executions Execution[]
+
+  @@index([userId, submittedAt])
+  @@index([marketId, status])
+  @@index([batchId])
 }
 
+enum BatchType {
+  ORD
+  WDR
+}
+
+enum BatchState {
+  BUILT
+  SENT
+  ACKED
+  PROCESSED
+  FAILED
+}
+
+// Un lot par cut-off, par SDB et par type de fichier (blueprint §4.5).
+model OrderBatch {
+  id           String        @id @default(uuid())
+  marketId     String
+  market       Market        @relation(fields: [marketId], references: [id])
+  partnerId    String
+  partner      MarketPartner @relation(fields: [partnerId], references: [id])
+  type         BatchType     @default(ORD)
+  sequence     Int
+  cutoffAt     DateTime
+  fileName     String        @unique
+  fileHash     String? // SHA-256 du fichier — repris dans le manifeste signé
+  manifestSig  String?
+  state        BatchState    @default(BUILT)
+  lineCount    Int           @default(0)
+  sentAt       DateTime?
+  ackAt        DateTime?
+  processedAt  DateTime?
+  notes        String?
+  createdById  String?
+  createdAt    DateTime      @default(now())
+
+  orders         Order[]
+  executions     Execution[]
+  paymentIntents PaymentIntent[]
+
+  @@index([partnerId, cutoffAt])
+  @@index([state])
+}
+
+enum SettlementState {
+  UNSETTLED
+  SETTLING
+  SETTLED
+  FAILED
+}
+
+// Une ligne EXE = une exécution ; le règlement-livraison est suivi séparément (§4.15).
+model Execution {
+  id              String          @id @default(uuid())
+  orderId         String
+  order           Order           @relation(fields: [orderId], references: [id])
+  batchId         String?
+  batch           OrderBatch?     @relation(fields: [batchId], references: [id])
+  quantity        Decimal         @db.Decimal(18, 4)
+  price           Decimal         @db.Decimal(18, 4)
+  grossAmount     Decimal         @db.Decimal(18, 2)
+  courtage        Decimal         @default(0) @db.Decimal(18, 2)
+  taxes           Decimal         @default(0) @db.Decimal(18, 2)
+  netAmount       Decimal         @db.Decimal(18, 2)
+  sdbExecRef      String?         @unique
+  executedAt      DateTime
+  settlementDate  DateTime?       @db.Date
+  settlementState SettlementState @default(UNSETTLED)
+  settledAt       DateTime?
+  fillTxnId       String? // LedgerTxn FILL
+  settlementTxnId String? // LedgerTxn SETTLEMENT
+  createdAt       DateTime        @default(now())
+
+  @@index([orderId])
+  @@index([settlementState, settlementDate])
+}
+
+// Dérivée des exécutions ; reconstruite chaque nuit (blueprint §4.2).
 model Position {
-  id           String     @id @default(uuid())
-  userId       String
-  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
-  instrumentId String
-  instrument   Instrument @relation(fields: [instrumentId], references: [id])
-  quantity     Decimal    @db.Decimal(18, 4)
-  avgCost      Decimal    @db.Decimal(18, 4)
-  currency     String
-  updatedAt    DateTime   @updatedAt
+  id               String     @id @default(uuid())
+  userId           String
+  user             User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  instrumentId     String
+  instrument       Instrument @relation(fields: [instrumentId], references: [id])
+  quantity         Decimal    @db.Decimal(18, 4) // titres réglés
+  pendingQuantity  Decimal    @default(0) @db.Decimal(18, 4) // exécutés, non réglés
+  reservedQuantity Decimal    @default(0) @db.Decimal(18, 4) // ordres de vente en cours
+  avgCost          Decimal    @db.Decimal(18, 4)
+  currency         String
+  updatedAt        DateTime   @updatedAt
 
   @@unique([userId, instrumentId])
 }
@@ -519,35 +791,53 @@ model RecurringPlan {
 }
 
 // =========================================================================
-// 6. FRAIS (MODULE 9.5)
+// 7. FRAIS (blueprint §3.2 : chaque frais est une ligne du grand livre)
 // =========================================================================
 
 enum FeeType {
-  BROKERAGE
+  COURTAGE_SDB
+  COMMISSION_ALKE
   FX_SPREAD
-  MANAGEMENT
+  TAXE
   WITHDRAWAL
 }
 
 model FeeSchedule {
-  id            String   @id @default(uuid())
+  id            String    @id @default(uuid())
   marketId      String?
-  market        Market?  @relation(fields: [marketId], references: [id])
+  market        Market?   @relation(fields: [marketId], references: [id])
   feeType       FeeType
-  isPercentage  Boolean  @default(true)
-  value         Decimal  @db.Decimal(10, 4) // ex. 1.5000 = 1,5 % si isPercentage, sinon montant fixe
-  minAmount     Decimal? @db.Decimal(18, 2)
-  maxAmount     Decimal? @db.Decimal(18, 2)
+  isPercentage  Boolean   @default(true)
+  value         Decimal   @db.Decimal(10, 4)
+  minAmount     Decimal?  @db.Decimal(18, 2)
+  maxAmount     Decimal?  @db.Decimal(18, 2)
   label         String
-  effectiveFrom DateTime @default(now())
-  isActive      Boolean  @default(true)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  effectiveFrom DateTime  @default(now())
+  effectiveTo   DateTime?
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([feeType, effectiveFrom])
+}
+
+// Seuils versionnés (blueprint §4.18) : plafonds pilote, cut-offs, matérialité, SLA…
+model ConfigValue {
+  id            String    @id @default(uuid())
+  key           String
+  value         Json
+  effectiveFrom DateTime  @default(now())
+  effectiveTo   DateTime?
+  createdById   String?
+  approvedById  String?
+  auditLogId    String?
+  createdAt     DateTime  @default(now())
+
+  @@index([key, effectiveFrom])
 }
 
 // =========================================================================
-// 7. PORTEFEUILLE EXTERNE, PARRAINAGE, ABONNEMENT PRO, NOTIFICATIONS
-//    (fonctionnalités additionnelles déjà en place côté app — Module 7)
+// 8. FONCTIONS ADDITIONNELLES (hors v1.0 : derrière indicateur)
 // =========================================================================
 
 model ExternalHolding {
@@ -573,17 +863,17 @@ enum ReferralStatus {
 }
 
 model Referral {
-  id              String         @id @default(uuid())
-  referrerUserId  String
-  referrer        User           @relation("ReferralReferrer", fields: [referrerUserId], references: [id])
-  refereeUserId   String?        @unique
-  referee         User?          @relation("ReferralReferee", fields: [refereeUserId], references: [id])
-  code            String
-  status          ReferralStatus @default(INVITED)
-  rewardAmount    Decimal?       @db.Decimal(18, 2)
-  rewardCurrency  String?
-  createdAt       DateTime       @default(now())
-  rewardedAt      DateTime?
+  id             String         @id @default(uuid())
+  referrerUserId String
+  referrer       User           @relation("ReferralReferrer", fields: [referrerUserId], references: [id])
+  refereeUserId  String?        @unique
+  referee        User?          @relation("ReferralReferee", fields: [refereeUserId], references: [id])
+  code           String
+  status         ReferralStatus @default(INVITED)
+  rewardAmount   Decimal?       @db.Decimal(18, 2)
+  rewardCurrency String?
+  createdAt      DateTime       @default(now())
+  rewardedAt     DateTime?
 
   @@index([referrerUserId])
 }
@@ -611,20 +901,18 @@ model Subscription {
 }
 
 model NotificationPreference {
-  id           String  @id @default(uuid())
-  userId       String  @unique
-  user         User    @relation(fields: [userId], references: [id], onDelete: Cascade)
-  push         Boolean @default(true)
-  priceAlerts  Boolean @default(true)
-  news         Boolean @default(true)
-  orders       Boolean @default(true)
-  promo        Boolean @default(false)
-  community    Boolean @default(true)
-  email        Boolean @default(true)
+  id          String  @id @default(uuid())
+  userId      String  @unique
+  user        User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  push        Boolean @default(true)
+  priceAlerts Boolean @default(true)
+  news        Boolean @default(true)
+  orders      Boolean @default(true)
+  promo       Boolean @default(false)
+  community   Boolean @default(true)
+  email       Boolean @default(true)
 }
 
-// Journal interne des notifications — consultable dans l'app même avant
-// que Firebase Cloud Messaging ne soit branché pour l'envoi push réel.
 model Notification {
   id        String    @id @default(uuid())
   userId    String
@@ -638,6 +926,39 @@ model Notification {
   @@index([userId, readAt])
 }
 
+enum NotificationChannel {
+  SMS
+  PUSH
+  EMAIL
+  IN_APP
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENT
+  FAILED
+}
+
+// Journal de livraison unique pour tous les canaux (blueprint §4.19).
+model NotificationLog {
+  id          String              @id @default(uuid())
+  userId      String?
+  channel     NotificationChannel
+  recipient   String
+  template    String
+  payload     Json?
+  status      NotificationStatus  @default(QUEUED)
+  attempts    Int                 @default(0)
+  providerRef String?
+  error       String?
+  eventName   String?
+  createdAt   DateTime            @default(now())
+  sentAt      DateTime?
+
+  @@index([status, createdAt])
+  @@index([userId])
+}
+
 model NpsResponse {
   id        String   @id @default(uuid())
   userId    String
@@ -648,7 +969,7 @@ model NpsResponse {
 }
 
 // =========================================================================
-// 8. SUPPORT CLIENT (MODULE 8)
+// 9. SUPPORT CLIENT
 // =========================================================================
 
 enum TicketStatus {
@@ -666,17 +987,17 @@ enum TicketPriority {
 }
 
 model SupportTicket {
-  id        String              @id @default(uuid())
+  id        String         @id @default(uuid())
   userId    String
-  user      User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
   subject   String
   category  String
-  status    TicketStatus        @default(OPEN)
-  priority  TicketPriority      @default(NORMAL)
-  createdAt DateTime            @default(now())
+  status    TicketStatus   @default(OPEN)
+  priority  TicketPriority @default(NORMAL)
+  createdAt DateTime       @default(now())
   closedAt  DateTime?
 
-  messages  SupportTicketMessage[]
+  messages SupportTicketMessage[]
 
   @@index([userId])
   @@index([status])
@@ -688,32 +1009,163 @@ enum TicketAuthorType {
 }
 
 model SupportTicketMessage {
-  id        String           @id @default(uuid())
-  ticketId  String
-  ticket    SupportTicket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  id         String           @id @default(uuid())
+  ticketId   String
+  ticket     SupportTicket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
   authorType TicketAuthorType
-  authorId  String?
-  body      String
-  createdAt DateTime         @default(now())
+  authorId   String?
+  body       String
+  createdAt  DateTime         @default(now())
 
   @@index([ticketId])
 }
 
 // =========================================================================
-// 9. CONFORMITÉ — JOURNAL D'AUDIT (MODULE 9.4)
+// 10. CONFORMITÉ : MAKER-CHECKER, DOSSIERS, ALERTES (blueprint §4.17)
+// =========================================================================
+
+enum ApprovalState {
+  PENDING
+  APPROVED
+  REJECTED
+  EXECUTED
+  FAILED
+}
+
+// Toute action sensible = Maker → PENDING → Checker → EXECUTED. Un maker ne
+// peut pas valider sa propre action.
+model PendingApproval {
+  id         String        @id @default(uuid())
+  actionType String // LIVE_TRADING_TOGGLE | LEDGER_ADJUST | LEDGER_REVERSAL | WITHDRAWAL_OVERRIDE | FEE_CHANGE | INSTRUMENT_ACTIVATION | USER_UNBLOCK | COMPLIANCE_DECISION | RECON_WRITE_OFF | ORDER_REVIEW | CONFIG_CHANGE
+  entityType String?
+  entityId   String?
+  payload    Json
+  reason     String
+  makerId    String
+  maker      User          @relation("ApprovalMaker", fields: [makerId], references: [id])
+  checkerId  String?
+  checker    User?         @relation("ApprovalChecker", fields: [checkerId], references: [id])
+  state      ApprovalState @default(PENDING)
+  decisionNote String?
+  decidedAt  DateTime?
+  executedAt DateTime?
+  error      String?
+  auditLogId String?
+  createdAt  DateTime      @default(now())
+
+  @@index([state, createdAt])
+  @@index([entityType, entityId])
+}
+
+enum AlertSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum AlertSource {
+  KYC_SCREENING
+  RECONCILIATION
+  TRANSACTION_THRESHOLD
+  SETTLEMENT_FAILURE
+  WITHDRAWAL_VELOCITY
+  MANUAL
+}
+
+enum AlertStatus {
+  OPEN
+  ATTACHED
+  DISMISSED
+}
+
+model ComplianceAlert {
+  id        String        @id @default(uuid())
+  source    AlertSource
+  severity  AlertSeverity
+  status    AlertStatus   @default(OPEN)
+  userId    String?
+  entityType String?
+  entityId  String?
+  summary   String
+  details   Json?
+  caseId    String?
+  case      ComplianceCase? @relation(fields: [caseId], references: [id])
+  createdAt DateTime      @default(now())
+
+  @@index([status, severity])
+  @@index([userId])
+}
+
+enum ComplianceCaseState {
+  OPEN
+  UNDER_REVIEW
+  ESCALATED
+  CLEARED
+  REPORTED
+  CLOSED
+}
+
+model ComplianceCase {
+  id        String              @id @default(uuid())
+  reference String              @unique
+  subjectUserId String?
+  subject   User?               @relation("ComplianceSubject", fields: [subjectUserId], references: [id])
+  state     ComplianceCaseState @default(OPEN)
+  ownerId   String?
+  title     String
+  openedAt  DateTime            @default(now())
+  closedAt  DateTime?
+
+  alerts    ComplianceAlert[]
+  notes     ComplianceNote[]
+  decisions ComplianceDecision[]
+
+  @@index([state])
+}
+
+model ComplianceNote {
+  id        String         @id @default(uuid())
+  caseId    String
+  case      ComplianceCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  authorId  String
+  body      String
+  createdAt DateTime       @default(now())
+
+  @@index([caseId])
+}
+
+model ComplianceDecision {
+  id               String         @id @default(uuid())
+  caseId           String
+  case             ComplianceCase @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  decision         String // CLEARED | REPORTED_TO_ANIF | ACCOUNT_BLOCKED | ...
+  decidedById      String
+  approvalId       String? // PendingApproval (maker-checker)
+  regulatoryReportRef String?
+  decidedAt        DateTime       @default(now())
+}
+
+// =========================================================================
+// 11. JOURNAL D'AUDIT CHAÎNÉ (blueprint §4.10) — append-only
 // =========================================================================
 
 model AuditLog {
   id            String   @id @default(uuid())
+  seq           BigInt   @unique @default(autoincrement())
   actorUserId   String?
   actor         User?    @relation("AuditActor", fields: [actorUserId], references: [id])
   actorRole     String?
-  action        String // ex. "KYC_APPROVED", "ORDER_STATUS_CHANGED", "FEE_SCHEDULE_UPDATED"
+  actorType     String   @default("USER") // USER | ADMIN | SYSTEM | SDB_FILE | PROVIDER
+  action        String
   entityType    String
   entityId      String
   beforeJson    Json?
   afterJson     Json?
   ipAddress     String?
+  correlationId String?
+  prevHash      String?
+  hash          String
   createdAt     DateTime @default(now())
 
   @@index([entityType, entityId])
