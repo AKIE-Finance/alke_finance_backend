@@ -183,14 +183,18 @@ describe('Brokerage — order engine (blueprint §4.3, §4.5, §4.15)', () => {
     expect((await batches.processAck(batch.id, ackLines)).accepted).toEqual([]);
 
     // --- EXE at a better price than estimated: part of the reserve comes back.
+    // Executed "today" at the market's 11:00 fixing: with no settlement_date the
+    // backend derives J+3 from executed_at, so the settlement assertions below
+    // stay valid whatever the calendar date the suite runs on.
+    const executedAtIso = `${new Date().toISOString().slice(0, 10)}T11:00:00+01:00`;
     const exeLine = {
       order_id: order.id, sdb_ref: acked.sdbRef!, executed_qty: '10', price: '4900', gross_amount: '49000', courtage: '490', taxes: '245',
-      net_amount: '49735', settlement_date: '', executed_at: '2026-09-04T11:00:00+01:00', status: 'FILLED' as const,
+      net_amount: '49735', settlement_date: '', executed_at: executedAtIso, status: 'FILLED' as const,
     };
     const exe = await batches.processExecutions(batch.id, [exeLine]);
     expect(exe.executions).toHaveLength(1);
     const execution = await prisma.execution.findUniqueOrThrow({ where: { id: exe.executions[0] } });
-    expect(execution.sdbExecRef).toBe(`${acked.sdbRef}:2026-09-04T11:00:00+01:00`);
+    expect(execution.sdbExecRef).toBe(`${acked.sdbRef}:${executedAtIso}`);
     expect(execution.settlementState).toBe(SettlementState.UNSETTLED);
     const fill = await txnByKey(`fill:${execution.id}`);
     expect(fill?.type).toBe(LedgerTxnType.FILL);
